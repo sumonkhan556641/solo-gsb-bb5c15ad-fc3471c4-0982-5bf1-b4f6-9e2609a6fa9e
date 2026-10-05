@@ -18,10 +18,9 @@
 const { getDb } = require('./db');
 const { parseClaimDate, claimInterval, formatClaimDate } = require('./dates');
 const { getVersionDetail, latestVersionNo } = require('./publish');
-
-function draftRevisionNo() {
-  return getDb().prepare('SELECT revision FROM draft_meta WHERE id = 1').get().revision;
-}
+// 草稿修订号读取统一由 draft.js 提供（发布 / 预约的一致性读取也用它），
+// 这里再导出以保持既有引用（bundle / session / routes）不变。
+const { draftRevisionNo } = require('./draft');
 
 // 当前「草稿代」：已确认恢复的次数（draft_restores 最大行号）。
 // 恢复会整体替换草稿并重排对象编号；并行编辑会话以此识别基线对象身份是否已更替。

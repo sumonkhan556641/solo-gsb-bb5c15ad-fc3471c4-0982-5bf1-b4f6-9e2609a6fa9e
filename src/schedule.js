@@ -2,11 +2,14 @@
 
 // 预约发布：编辑者为通过现有发布校验的草稿选定每事件主张，并指定未来 UTC 时刻。
 //
-// 建立预约（createSchedule）时即冻结：
+// 建立预约（createSchedule）时即冻结（与即时发布同一条一致性读取路径）：
 //   - 事件、每事件所选主张（精度/区间/出处/考异）、全部「先于」关系；
 //   - 求解器确定的具体日期（resolvedDate）；
-//   - 当前最新版本号 baseVersionNo（冻结的基准版本号）。
-// 此后草稿的任何增删改、从历史版本恢复都不影响预约内容。
+//   - 当前最新版本号 baseVersionNo（冻结的基准版本号）；
+//   - 与冻结内容同属一份草稿状态的草稿修订号 draftRevisionNo（仅溯源）。
+// 读取（前后复核修订号）与写入事务（BEGIN IMMEDIATE 内再复核修订号）共同保证
+// 冻结内容来自同一时刻的草稿；期间草稿被其它进程改动即 409 DRAFT_CONFLICT，
+// 整次不建立预约。此后草稿的任何增删改、从历史版本恢复都不影响预约内容。
 // 时间非法（非 UTC/解析失败）或不是未来时刻 → 400；选择为空 → 400；
 // 草稿不能通过现有发布校验（缺主张/成环/时间无解）→ 422；基准版本过期 → 409；
 // 以上均不建立预约。
@@ -33,7 +36,8 @@ const {
   getVersionSummary,
 } = require('./publish');
 const { isRetracted } = require('./retract');
-const { draftRevisionNo } = require('./restore');
+// 经模块对象调用，测试可替换 readConsistentDraft 以模拟并发进程交错
+const draftStore = require('./draft');
 
 const STATUSES = ['pending', 'published', 'conflict', 'cancelled'];
 
@@ -103,8 +107,9 @@ function createSchedule({ selectionList, scheduledAtRaw, baseVersionNo, editor =
     };
   }
 
-  // 走与即时发布完全相同的现有校验与求解
-  const evalResult = evaluateDraft(selectionList);
+  // 走与即时发布完全相同的现有校验与求解，且读取的是同一份一致草稿状态
+  const draft = draftStore.readConsistentDraft();
+  const evalResult = evaluateDraft(selectionList, draft);
   if (!evalResult.ok) {
     throw {
       status: 422,
@@ -117,7 +122,10 @@ function createSchedule({ selectionList, scheduledAtRaw, baseVersionNo, editor =
   const editorStr = String(editor || '');
   const noteStr = String(note || '');
 
+  // BEGIN IMMEDIATE：复核修订号 + 基准版本检查 + 写预约在同一写锁内完成
   const tx = db.transaction(() => {
+    // 冻结内容必须仍是当前草稿状态；被其它进程改过即整体回滚，不建立预约
+    draftStore.assertDraftRevisionUnchanged(draft.revisionNo, '建立预约');
     // 事务内确认基准版本号仍为当前最新版本号，与即时发布同一约定
     const latest = latestVersionNo();
     if (base !== latest) {
@@ -140,7 +148,8 @@ function createSchedule({ selectionList, scheduledAtRaw, baseVersionNo, editor =
       .run(
         scheduledAt,
         base,
-        draftRevisionNo(),
+        // 记录与冻结内容同属一份草稿状态的修订号（而非事务内新读到的值）
+        draft.revisionNo,
         JSON.stringify(selectionList),
         JSON.stringify(payload),
         snapshot.eventRows.length,
@@ -151,7 +160,7 @@ function createSchedule({ selectionList, scheduledAtRaw, baseVersionNo, editor =
     return info.lastInsertRowid;
   });
 
-  const id = tx();
+  const id = tx.immediate();
   return getSchedule(id);
 }
 
@@ -194,6 +203,7 @@ function runDueSchedules(nowMs = Date.now()) {
 }
 
 // 单条预约在一个事务内完成：检查基准 → 写不可变版本 + 翻状态（整体原子）。
+// BEGIN IMMEDIATE：两个服务进程都跑调度器时，后到者在写锁上等待而不是失败。
 function processOne(row, published, conflicts) {
   const db = getDb();
   const payload = JSON.parse(row.payload_json);
@@ -243,7 +253,7 @@ function processOne(row, published, conflicts) {
 
   // 失败时事务整体回滚（该条仍为 pending，由 runDueSchedules 记录并在下轮重试），
   // 不影响同一轮中排在其后的其它预约。
-  const out = tx();
+  const out = tx.immediate();
   if (out && out.published) published.push({ scheduleNo: row.id, versionNo: out.newNo });
   if (out && out.conflict) conflicts.push({ scheduleNo: row.id, baseVersionNo: row.base_version_no, currentVersionNo: out.latest });
 }

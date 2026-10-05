@@ -303,6 +303,9 @@ function getDb() {
   db = new Database(dbPath);
   db.pragma('journal_mode = WAL');
   db.pragma('foreign_keys = ON');
+  // 两个服务进程可共用同一数据库文件：写锁竞争时最多等待 5 秒再失败，
+  // 避免一方写入期间另一方的写事务立即收到 SQLITE_BUSY。
+  db.pragma('busy_timeout = 5000');
   db.exec(SCHEMA);
   migrate(db);
   return db;

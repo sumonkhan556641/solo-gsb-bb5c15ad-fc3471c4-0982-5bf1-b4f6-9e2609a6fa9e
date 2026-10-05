@@ -3,15 +3,15 @@
 const { getDb } = require('./db');
 const { solve, claimToInterval } = require('./solver');
 const { isoFromOrdinal } = require('./dates');
+// 经模块对象调用，测试可替换 readConsistentDraft 以模拟「另一进程在读取与
+// 写入之间改动草稿」的并发交错。
+const draftStore = require('./draft');
 
 // 组装草稿现状并求解；不写库。
-function evaluateDraft(selectionList) {
-  const db = getDb();
-  const events = db.prepare('SELECT id, title, description FROM events ORDER BY id').all();
-  const claims = db.prepare('SELECT * FROM claims').all();
-  const relations = db
-    .prepare('SELECT id, earlier_id AS earlierId, later_id AS laterId, source, note FROM relations ORDER BY id')
-    .all();
+// draftState 可选：调用方（发布 / 预约）已读取的一致草稿状态，
+// 缺省时现场读取一份一致草稿状态（如校验接口）。
+function evaluateDraft(selectionList, draftState) {
+  const { events, claims, relations } = draftState || draftStore.readConsistentDraft();
 
   const claimsById = new Map(claims.map((c) => [c.id, c]));
   const selected = new Map();
@@ -143,6 +143,9 @@ function insertVersionFromSnapshot({ db, newNo, parentNo, editor, note, snapshot
 
 // 发布一个新版本。selectionList: [{eventId, claimId}]
 // baseVersionNo: 编辑者发起修改时所基于的版本号；null/0 表示尚无版本。
+// 全程使用同一份草稿状态：先读取一致草稿（事件/主张/关系 + 修订号）再求解，
+// 写入事务（BEGIN IMMEDIATE）内先复核修订号未变，再确认基准版本并写快照；
+// 期间草稿被其它进程改动即抛 409 DRAFT_CONFLICT，整次不生成版本。
 // 抛 { status, ...body } 表示 HTTP 错误。
 function publishVersion({ selectionList, baseVersionNo, editor, note }) {
   const db = getDb();
@@ -153,7 +156,9 @@ function publishVersion({ selectionList, baseVersionNo, editor, note }) {
 
   const base = Number(baseVersionNo || 0);
 
-  const evalResult = evaluateDraft(selectionList);
+  // 一致草稿状态：事件 / 主张 / 关系与其修订号来自同一时刻（见 draft.js）
+  const draft = draftStore.readConsistentDraft();
+  const evalResult = evaluateDraft(selectionList, draft);
   if (!evalResult.ok) {
     throw {
       status: 422,
@@ -163,8 +168,10 @@ function publishVersion({ selectionList, baseVersionNo, editor, note }) {
   }
   const snapshot = buildFrozenSnapshot(evalResult);
 
-  // 在事务内再次确认基准版本，避免并发下的静默覆盖
+  // BEGIN IMMEDIATE：复核修订号 + 基准版本检查 + 写版本在同一写锁内完成，
+  // 其它进程无法在复核与写入之间改动草稿
   const tx = db.transaction(() => {
+    draftStore.assertDraftRevisionUnchanged(draft.revisionNo, '发布准备');
     const row = db.prepare('SELECT MAX(version_no) AS no FROM versions').get();
     const latest = row.no || 0;
     if (base !== latest) {
@@ -183,7 +190,7 @@ function publishVersion({ selectionList, baseVersionNo, editor, note }) {
     return newNo;
   });
 
-  const newNo = tx();
+  const newNo = tx.immediate();
   return { versionNo: newNo, version: getVersionDetail(newNo) };
 }
 

@@ -92,8 +92,8 @@ PORT=8080 EDITOR_TOKEN=my-secret npm start
 
 除即时发布外，编辑者可为**通过现有发布校验的草稿**选定每事件主张，并指定一个**未来 UTC 时间**预约发布：
 
-- **建立即冻结**：预约成功时，系统把当时的**事件、每事件所选主张、「先于」关系、求解日期**与**当前最新版本号（冻结基准版本号）**整体复制进预约。此后编辑者修改草稿、增删主张、从历史版本恢复草稿，**都不改变预约内容**；到期前访客仍只见当前最新版本。
-- **建立即校验**：时间必须是合法的未来 UTC 时刻（形如 `2026-10-02T12:34:00Z`，只接受 `Z` 结尾；秒可省略）。时间非法或已过期返回 **400**（`INVALID_SCHEDULED_TIME`）；主张选择为空 **400**；草稿不能通过现有发布校验（缺主张 / 成环 / 时间无解）返回 **422**（与即时发布同一错误结构）；`baseVersionNo` 不等于当前最新版本号返回 **409** `VERSION_CONFLICT`。**以上情况都不建立预约**。
+- **建立即冻结**：预约成功时，系统把当时的**事件、每事件所选主张、「先于」关系、求解日期**与**当前最新版本号（冻结基准版本号）**整体复制进预约。冻结内容取自**同一份草稿状态**（与即时发布同一条一致性读取路径，见「多进程共用数据库」一节），预约记录的 `draftRevisionNo` 即该状态的草稿修订号。此后编辑者修改草稿、增删主张、从历史版本恢复草稿，**都不改变预约内容**；到期前访客仍只见当前最新版本。
+- **建立即校验**：时间必须是合法的未来 UTC 时刻（形如 `2026-10-02T12:34:00Z`，只接受 `Z` 结尾；秒可省略）。时间非法或已过期返回 **400**（`INVALID_SCHEDULED_TIME`）；主张选择为空 **400**；草稿不能通过现有发布校验（缺主张 / 成环 / 时间无解）返回 **422**（与即时发布同一错误结构）；`baseVersionNo` 不等于当前最新版本号返回 **409** `VERSION_CONFLICT`；建立期间草稿被其它进程改动返回 **409** `DRAFT_CONFLICT`（见「多进程共用数据库」一节）。**以上情况都不建立预约**。
 - **到期执行**：调度器在服务启动时立即补跑一次（停机期间到期的预约不丢失），之后每 1 秒检查一次（可用 `SCHEDULE_TICK_MS` 调整）。到期的待执行预约按**预约时间、预约号顺序**逐条处理：
   - 仅当**冻结的基准版本号仍等于当前最新版本号、且该基准版未被撤回**时，用冻结内容在一个事务内**生成一个不可变新版本**（写版本与翻转预约状态同事务，失败整体回滚，绝不留半版）；
   - 否则把预约标记为 **冲突（conflict）**：**不发布、不自动改基准**，冻结的完整内容保留在预约详情中供编辑者查看，编辑者可核对后即时发布或另建预约。**以已撤回版为冻结基准的预约到期同样转冲突**（撤回与到期发布竞争时按事务提交顺序裁决：撤回先提交则预约转冲突；发布先提交则新版本保留，撤回仅作用指定版）。
@@ -500,6 +500,34 @@ curl -s -X POST "$BASE/api/editor/routes" \
 - **不会**静默覆盖对方版本；
 - 第二人需点击「刷新到最新版本并重新确认选择」，重新核对每个事件的主张单选后再发布。
 
+### 多进程共用数据库：发布 / 预约的草稿一致性（本轮变化）
+
+两个服务进程可以共用同一 SQLite 数据库文件（WAL 模式；写锁竞争时最多等待 5 秒再失败，不会立即报 `SQLITE_BUSY`）。即时发布与建立预约都要**先读草稿（事件 / 主张 / 关系）、求解，之后才进入写入事务**；若另一进程在读取之间一次性改动事件与主张，旧实现可能把**从未同时存在过的混合内容**冻结进版本，预约还可能把旧快照配上事务内新读到的修订号。本轮修复了这条并发窗口：
+
+- **一次操作只使用同一份草稿状态**：先读草稿修订号，再读事件 / 主张 / 关系，最后再读修订号，两次一致才用于求解与冻结（读取期间被改动会自动重试）；写入事务（`BEGIN IMMEDIATE`，持写锁）内**先复核修订号未变**，再确认基准版本号并落库。由此冻结的事件、所选主张、关系、求解日期与修订号必属同一时刻真实存在过的草稿状态。
+- **无法取得一致状态即报草稿冲突**：读取持续不稳定，或写入前复核发现草稿已被其它进程改动，即时发布与建立预约都返回 **409**（`DRAFT_CONFLICT`，附当前修订号），**整次不生成版本或预约**（不留半版、不写预约行）；稍后基于最新草稿重试即可。
+- **既有约定不变**：`selection`、`baseVersionNo` 参数照旧；`VERSION_CONFLICT`（409）、发布校验（422）、预约时间校验（400）与预约到期执行（published / conflict）、冻结语义、取消规则完全不变；预约记录的 `draftRevisionNo` 现在就是冻结内容所属那份草稿的修订号。
+
+```bash
+TOKEN=editor
+BASE=http://localhost:3000
+# 另起一个共用同一数据库文件的第二进程（另一终端）
+PORT=3100 DB_PATH=./data/chronicle.db EDITOR_TOKEN=$TOKEN npm start
+
+# 两个进程同时发布（同一 baseVersionNo）：恰一个 201，另一个 409 VERSION_CONFLICT
+curl -s -X POST "$BASE/api/editor/publish" -H "Content-Type: application/json" \
+  -H "X-Editor-Token: $TOKEN" -d '{"selection":[…],"baseVersionNo":2}' &
+curl -s -X POST http://localhost:3100/api/editor/publish -H "Content-Type: application/json" \
+  -H "X-Editor-Token: $TOKEN" -d '{"selection":[…],"baseVersionNo":2}' &
+
+# 一进程改草稿、另一进程发布 / 预约的交错窗口被捕获时：
+# => 409 {"code":"DRAFT_CONFLICT",
+#        "message":"草稿冲突：发布准备期间草稿被其它编辑改动（修订号 41 → 42）。本次未生成任何版本或预约…",
+#        "baseRevisionNo":41,"currentRevisionNo":42}
+```
+
+完整可运行的端到端示例见 `examples/publish-concurrency-example.sh`（自动拉起共用同一数据库的第二进程：两进程并发发布、并发下改草稿 + 发布 / 预约命中 `DRAFT_CONFLICT`、版本号连续无空洞、预约到期自动发布，约 20 秒）。
+
 ### 并行编辑会话（两人同时整理草稿：暂存 → 三方合并提交）
 
 两名编辑者需要**同时整理同一份草稿**（不止发布时刻冲突）时，可在工作台「并行编辑会话」卡片各自**开启编辑会话**，或直接调用 HTTP API：
@@ -643,10 +671,14 @@ curl -s -X POST "$BASE/api/editor/sessions/$SID2/commit" -H "X-Editor-Token: $TO
 src/
   server.js     Express 入口、口令中间件、静态界面
   routes.js     公开只读 API 与编辑者草稿/发布/恢复 API
-  db.js         SQLite 连接与建表（草稿区 + 草稿修订号触发器 + 版本快照区）
+  db.js         SQLite 连接与建表（草稿区 + 草稿修订号触发器 + 版本快照区）；
+                设 busy_timeout，多进程共用同一数据库文件时写锁竞争等待而非立即失败
+  draft.js      草稿一致性读取与复核：前后夹读修订号得到同一份草稿状态（不稳定重试，
+                耗尽报 409 DRAFT_CONFLICT）；写入事务内复核修订号未变（变化即冲突回滚）
   dates.js      年/月/日精度 → 覆盖区间（公历序数日）
   solver.js     Tarjan 环检测 + 拓扑下界传播求严格先后可行解
-  publish.js    发布事务：再校验 + 版本冲突检查 + 写不可变快照
+  publish.js    发布事务：一致草稿读取 + 再校验 + 事务内复核修订号 / 版本冲突检查
+                （BEGIN IMMEDIATE）+ 写不可变快照；草稿被并发改动即 409 DRAFT_CONFLICT
   restore.js    恢复草稿：只读预览 + 原子替换事务（修订号/版本号冲突检查、按快照重建）；
                 事务内登记 draft_restores（草稿代 +1），供并行编辑会话识别对象身份更替
   bundle.js     采访整理包导入：整包校验 + 内容指纹 + 只读预览 + 事务追加（批次防重/修订号冲突检查）
@@ -658,7 +690,9 @@ src/
                 替代须提交所见附记号（事务内核对，两人同时替代仅一个成功，冲突方取得当前附记且不落库）；
                 同一目标只展示最新生效附记，旧附记以替代链保留供追溯；公开读出层按 trim 折叠规则遮盖附记出处，
                 目标版撤回后访客不可见
-  schedule.js   预约发布：建立时冻结快照/基准版本号；到期按时间、预约号顺序逐条事务执行（发布或标冲突，幂等不重发不留半版；基准版已撤回 → 冲突）；查看/取消
+  schedule.js   预约发布：建立时按一致草稿状态冻结快照/基准版本号/草稿修订号（并发改动即
+                409 DRAFT_CONFLICT，不建立预约）；到期按时间、预约号顺序逐条事务执行
+                （BEGIN IMMEDIATE，发布或标冲突，幂等不重发不留半版；基准版已撤回 → 冲突）；查看/取消
   scheduler.js  预约调度器：每秒检查到期预约，服务启动立即补跑（重启安全）
   route.js      专题脉络路线：锚点校验 + 线性时间见证链求解（正/反向 BFS 定层 + 逐层最小关系 ID 贪心
                 + 父指针回溯；每段关系数最少、同长度按关系 ID 序列择小，长链不逐层复制路径）
@@ -671,8 +705,8 @@ src/
                 成功提交事务内原子应用（修订号只推进一次）并返回临时编号映射，重复提交幂等
   seed.js       演示数据
 public/         访客页与编辑台（原生 HTML/CSS/JS）
-examples/       采访整理包 JSON 示例；出处遮盖、预约发布、脉络路线（含两万事件长链路线）、版本撤回、勘误附记、并行编辑会话（含跨恢复冲突）curl 调用示例
-test/           node:test 单元与端到端测试（含成环、无解、409 冲突、草稿恢复、整理包导入、出处遮盖、预约发布/重启补跑、脉络路线（含两万事件长链路线与随机图新旧求解对照）、版本撤回、勘误附记替代与并发冲突、并行编辑会话三方合并与跨恢复对象身份更替）
+examples/       采访整理包 JSON 示例；出处遮盖、预约发布、脉络路线（含两万事件长链路线）、版本撤回、勘误附记、并行编辑会话（含跨恢复冲突）、两进程并发发布/预约草稿一致性 curl 调用示例
+test/           node:test 单元与端到端测试（含成环、无解、409 冲突、草稿恢复、整理包导入、出处遮盖、预约发布/重启补跑、脉络路线（含两万事件长链路线与随机图新旧求解对照）、版本撤回、勘误附记替代与并发冲突、并行编辑会话三方合并与跨恢复对象身份更替、两进程共用数据库的发布/预约草稿一致性）
 ```
 
 ## 主要 HTTP API
@@ -694,7 +728,7 @@ test/           node:test 单元与端到端测试（含成环、无解、409 �
 - `POST /api/editor/validate` — 预校验（不落库）
 - `POST /api/editor/publish` — 发布；体含 `selection:[{eventId,claimId}]`、`baseVersionNo`、`editor`、`note`
   - 422：`{errors:[{type:missing|cycle|temporal, eventIds, relationIds, message, detail}]}`
-  - 409：`{code:"VERSION_CONFLICT", baseVersionNo, currentVersionNo, currentVersion}`
+  - 409：`{code:"VERSION_CONFLICT", baseVersionNo, currentVersionNo, currentVersion}`（基准版本过期）或 `{code:"DRAFT_CONFLICT", baseRevisionNo, currentRevisionNo}`（操作期间草稿被其它进程改动，整次不生成版本，重试即可）
 - `GET  /api/editor/restore-preview/:no` — 从第 `:no` 版恢复草稿的只读预览（该版被选内容 + 将被替换的当前草稿），返回 `draftRevisionNo`、`currentVersionNo`；版本不存在 404
 - `POST /api/editor/restore` — 确认恢复；体含 `versionNo`、`draftRevisionNo`、`currentVersionNo`（后两者取预览返回值）
   - 200：`{restoredFromVersionNo, currentVersionNo, revisionNo, idMap:{events,relations}, pendingSelection:[{eventId,claimId}], draft}`
@@ -712,8 +746,8 @@ test/           node:test 单元与端到端测试（含成环、无解、409 �
   - 409：`{code:"VERSION_CONFLICT", currentVersionNo, expectedVersionNo, ...}`（预览后发布了新版本，不落库）；空文本或版本号非法 400
 - `GET  /api/editor/redactions` — 已登记遮盖清单（编辑者视角，含出处原文与登记时间）
 - `POST /api/editor/schedules` — 建立预约发布；体含 `selection:[{eventId,claimId}]`、`scheduledAt`（未来 UTC，如 `2026-10-02T12:34:00Z`）、`baseVersionNo`、`editor`、`note`
-  - 201：`{schedule:{scheduleNo, scheduledAt, status:"pending", baseVersionNo, draftRevisionNo, eventCount, relationCount, frozen:{events:[…含 resolvedDate/source…], relations:[…]}, ...}}`（冻结快照）
-  - 400：时间非法 / 非未来时刻（`{code:"INVALID_SCHEDULED_TIME"}`）或选择为空；422：草稿未通过现有发布校验（`{errors:[...]}`，同即时发布）；409：`VERSION_CONFLICT`（基准版本号已过期）；均不建立预约
+  - 201：`{schedule:{scheduleNo, scheduledAt, status:"pending", baseVersionNo, draftRevisionNo, eventCount, relationCount, frozen:{events:[…含 resolvedDate/source…], relations:[…]}, ...}}`（冻结快照；`draftRevisionNo` 即冻结内容所属草稿的修订号）
+  - 400：时间非法 / 非未来时刻（`{code:"INVALID_SCHEDULED_TIME"}`）或选择为空；422：草稿未通过现有发布校验（`{errors:[...]}`，同即时发布）；409：`VERSION_CONFLICT`（基准版本号已过期）或 `DRAFT_CONFLICT`（操作期间草稿被其它进程改动，不建立预约）；均不建立预约
 - `GET  /api/editor/schedules` — 预约列表（待执行在前、按到期时刻升序；列表项含冻结事件摘要与执行结果）
 - `GET  /api/editor/schedules/:no` — 预约详情（展开冻结的完整事件 / 主张 / 关系 / 求解日期；不存在 404）
 - `DELETE /api/editor/schedules/:no` — 取消尚未执行的预约（200 `{cancelled:true}`；重复取消已取消的预约幂等 200 且 `alreadyCancelled:true`）
