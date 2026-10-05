@@ -372,6 +372,19 @@ async function doPublish() {
 }
 
 function showConflictDialog(body) {
+  // 草稿冲突（两进程共用库时，读快照与写事务之间草稿被另一操作改动）：
+  // 本次发布 / 预约已整次取消，只需刷新草稿、重新确认选择后重试，不涉及版本号。
+  if (body.code === 'DRAFT_REVISION_CONFLICT') {
+    $('#conflictBody').innerHTML = `
+      <p><b>草稿在你读取后被另一位编辑者改动过。</b></p>
+      <p>系统在写入前发现草稿修订号已由 <b>${esc(body.expectedRevisionNo)}</b> 变为
+         <b>${esc(body.currentRevisionNo)}</b>（事件 / 主张 / 关系可能已变化）。为避免冻结
+         从未同时存在过的混合内容，<b>本次操作已整体取消，未生成任何版本或预约</b>。</p>
+      <p class="muted">点击下方按钮刷新为最新草稿，<b>请逐条重新确认每个事件的主张选择</b>，再重新发布或建立预约。</p>`;
+    $('#conflictDialog').showModal();
+    return;
+  }
+
   const cur = body.currentVersion;
   const list = (evs) => (evs || []).map((e) => `<li>${esc(e.title)}</li>`).join('');
   $('#conflictBody').innerHTML = `
@@ -1667,7 +1680,11 @@ async function onClick(e) {
   if (t.id === 'conflictReload') {
     $('#conflictDialog').close();
     await loadState();
-    showGlobal('warn', `已刷新到第 ${baseVersionNo} 版后的最新草稿。请重新确认各事件的主张选择，再点击发布。`);
+    if (conflictData && conflictData.code === 'DRAFT_REVISION_CONFLICT') {
+      showGlobal('warn', `已刷新为最新草稿（修订号 ${conflictData.currentRevisionNo}）。请重新确认各事件的主张选择，再发布或建立预约。`);
+    } else {
+      showGlobal('warn', `已刷新到第 ${baseVersionNo} 版后的最新草稿。请重新确认各事件的主张选择，再点击发布。`);
+    }
     return;
   }
 

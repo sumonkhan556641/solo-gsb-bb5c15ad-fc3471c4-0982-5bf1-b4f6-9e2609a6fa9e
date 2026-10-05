@@ -303,6 +303,10 @@ function getDb() {
   db = new Database(dbPath);
   db.pragma('journal_mode = WAL');
   db.pragma('foreign_keys = ON');
+  // 两个服务进程共用同一库文件时，BEGIN IMMEDIATE 取写锁若撞上另一进程未提交的
+  // 写事务，按该超时等待（与 better-sqlite3 自身默认一致，显式声明以防环境覆盖）。
+  // 超时仍拿不到锁时，发布 / 预约写入路径会把 SQLITE_BUSY 转成明确的草稿冲突。
+  db.pragma('busy_timeout = 5000');
   db.exec(SCHEMA);
   migrate(db);
   return db;

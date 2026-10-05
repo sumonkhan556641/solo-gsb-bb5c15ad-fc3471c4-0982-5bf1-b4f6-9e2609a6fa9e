@@ -4,14 +4,65 @@ const { getDb } = require('./db');
 const { solve, claimToInterval } = require('./solver');
 const { isoFromOrdinal } = require('./dates');
 
+// 当前草稿修订号（events/claims/relations 任一增删改都由触发器推进）。
+// 与 restore.js 的 draftRevisionNo 同表同列；这里就地查询以避免顶层循环依赖。
+function readDraftRevision() {
+  return getDb().prepare('SELECT revision FROM draft_meta WHERE id = 1').get().revision;
+}
+
+// 409 草稿冲突：发布 / 预约组装快照所依据的草稿状态在读取与写入之间已被另一进程改写。
+// 明确返回冲突，调用方整次不生成版本或预约；编辑者刷新草稿、重新确认选择后重试。
+function draftConflictError({ kind, expected, current }) {
+  return {
+    status: 409,
+    code: 'DRAFT_REVISION_CONFLICT',
+    message:
+      `草稿冲突：${kind}读取草稿（事件 / 主张 / 关系 / 求解日期 / 修订号）后，草稿已被另一操作改动` +
+      `（修订号 ${expected} → ${current}）。本次${kind}已整体取消，未生成任何版本或预约；请重新查看最新草稿并确认选择后再试。`,
+    currentRevisionNo: current,
+    expectedRevisionNo: expected,
+  };
+}
+
+// 以 BEGIN IMMEDIATE 运行写入事务，返回其返回值。
+// 写锁等待超时（另一进程长时间持有写事务）也按「无法取得一致草稿状态」处理：
+// 抛 DRAFT_REVISION_CONFLICT，语义与修订号过期相同——刷新后重试，绝不冻结混合内容。
+function commitImmediateWithConflict(db, fn, { kind }) {
+  const tx = db.transaction(fn);
+  try {
+    return tx.immediate();
+  } catch (err) {
+    if (err && (err.code === 'SQLITE_BUSY' || err.code === 'SQLITE_LOCKED')) {
+      throw {
+        status: 409,
+        code: 'DRAFT_REVISION_CONFLICT',
+        message:
+          `草稿冲突：${kind}提交时另一进程正在修改草稿，未能取得一致草稿状态。` +
+          '本次操作已整体取消，未生成任何版本或预约；请重新查看最新草稿并确认选择后再试。',
+      };
+    }
+    throw err;
+  }
+}
+
 // 组装草稿现状并求解；不写库。
+// 事件、全部主张、「先于」关系与草稿修订号在同一个只读事务（同一快照）内读出，
+// 保证一次操作使用同一草稿状态：即便另一进程在读取期间改写事件与主张，
+// 这里也不会读到从未同时存在过的混合内容。
 function evaluateDraft(selectionList) {
   const db = getDb();
-  const events = db.prepare('SELECT id, title, description FROM events ORDER BY id').all();
-  const claims = db.prepare('SELECT * FROM claims').all();
-  const relations = db
-    .prepare('SELECT id, earlier_id AS earlierId, later_id AS laterId, source, note FROM relations ORDER BY id')
-    .all();
+
+  const read = db.transaction(() => {
+    const revisionNo = readDraftRevision();
+    const events = db.prepare('SELECT id, title, description FROM events ORDER BY id').all();
+    const claims = db.prepare('SELECT * FROM claims').all();
+    const relations = db
+      .prepare('SELECT id, earlier_id AS earlierId, later_id AS laterId, source, note FROM relations ORDER BY id')
+      .all();
+    return { revisionNo, events, claims, relations };
+  });
+
+  const { revisionNo, events, claims, relations } = read();
 
   const claimsById = new Map(claims.map((c) => [c.id, c]));
   const selected = new Map();
@@ -36,6 +87,7 @@ function evaluateDraft(selectionList) {
         relationIds: [],
         message: `事件「${titles.get(eid) || eid}」选定的主张不存在或不属于该事件`,
       })),
+      revisionNo,
       events,
       claims,
       relations,
@@ -43,7 +95,7 @@ function evaluateDraft(selectionList) {
   }
 
   const result = solve(events, selected, relations);
-  return { ...result, events, claims, relations, selected };
+  return { ...result, revisionNo, events, claims, relations, selected };
 }
 
 // 由求解结果构造可直接入库 / 冻结的快照数据（不写库）。
@@ -144,6 +196,13 @@ function insertVersionFromSnapshot({ db, newNo, parentNo, editor, note, snapshot
 // 发布一个新版本。selectionList: [{eventId, claimId}]
 // baseVersionNo: 编辑者发起修改时所基于的版本号；null/0 表示尚无版本。
 // 抛 { status, ...body } 表示 HTTP 错误。
+//
+// 并发正确性（两进程共用同一库）：
+//   事件 / 所选主张 / 关系 / 求解日期 / 草稿修订号先在同一快照内读出（evaluateDraft），
+//   随后在 BEGIN IMMEDIATE 写事务内再次核对草稿修订号——快照之后草稿若被另一进程
+//   改动过（含事件与主张在两次读取之间被一次性改动的情形），返回 409 草稿冲突，
+//   整次不生成版本；冻结进版本的内容必定来自某个真实同时存在过的草稿状态。
+//   基准版本号冲突仍按既有 409 VERSION_CONFLICT 语义处理（先草稿后版本）。
 function publishVersion({ selectionList, baseVersionNo, editor, note }) {
   const db = getDb();
 
@@ -162,9 +221,15 @@ function publishVersion({ selectionList, baseVersionNo, editor, note }) {
     };
   }
   const snapshot = buildFrozenSnapshot(evalResult);
+  const expectedRevision = evalResult.revisionNo;
 
-  // 在事务内再次确认基准版本，避免并发下的静默覆盖
-  const tx = db.transaction(() => {
+  // BEGIN IMMEDIATE + 事务内再确认草稿修订号与基准版本，避免并发下冻结混合内容或静默覆盖
+  const newNo = commitImmediateWithConflict(db, () => {
+    const revision = readDraftRevision();
+    if (expectedRevision !== revision) {
+      throw draftConflictError({ kind: '发布', expected: expectedRevision, current: revision });
+    }
+
     const row = db.prepare('SELECT MAX(version_no) AS no FROM versions').get();
     const latest = row.no || 0;
     if (base !== latest) {
@@ -178,12 +243,11 @@ function publishVersion({ selectionList, baseVersionNo, editor, note }) {
       };
     }
 
-    const newNo = latest + 1;
-    insertVersionFromSnapshot({ db, newNo, parentNo: base, editor, note, snapshot });
-    return newNo;
-  });
+    const nextNo = latest + 1;
+    insertVersionFromSnapshot({ db, newNo: nextNo, parentNo: base, editor, note, snapshot });
+    return nextNo;
+  }, { kind: '发布' });
 
-  const newNo = tx();
   return { versionNo: newNo, version: getVersionDetail(newNo) };
 }
 
@@ -238,4 +302,7 @@ module.exports = {
   latestVersionNo,
   getVersionDetail,
   getVersionSummary,
+  readDraftRevision,
+  draftConflictError,
+  commitImmediateWithConflict,
 };

@@ -5,11 +5,18 @@
 // 建立预约（createSchedule）时即冻结：
 //   - 事件、每事件所选主张（精度/区间/出处/考异）、全部「先于」关系；
 //   - 求解器确定的具体日期（resolvedDate）；
-//   - 当前最新版本号 baseVersionNo（冻结的基准版本号）。
+//   - 当前最新版本号 baseVersionNo（冻结的基准版本号）；
+//   - 草稿修订号 draftRevisionNo：与上面的事件 / 主张 / 关系 / 求解日期同属一个
+//     草稿快照（同一只读事务读出），不会再把旧快照配上新修订号。
 // 此后草稿的任何增删改、从历史版本恢复都不影响预约内容。
-// 时间非法（非 UTC/解析失败）或不是未来时刻 → 400；选择为空 → 400；
-// 草稿不能通过现有发布校验（缺主张/成环/时间无解）→ 422；基准版本过期 → 409；
-// 以上均不建立预约。
+//
+// 两进程共用同一库时的并发窗口由乐观并发控制关闭：先在同一快照内读出草稿状态并
+// 求解，随后在 BEGIN IMMEDIATE 写事务内再次核对草稿修订号——快照之后草稿若被另一
+// 进程改动过（含事件与主张在读取之间被一次性改动），返回 409 DRAFT_REVISION_CONFLICT
+// 草稿冲突，整次不建立预约（同样不生成版本）。冻结进预约的内容必定来自某个真实
+// 同时存在过的草稿状态。时间非法（非 UTC/解析失败）或不是未来时刻 → 400；
+// 选择为空 → 400；草稿不能通过现有发布校验（缺主张/成环/时间无解）→ 422；
+// 基准版本过期 → 409；写锁等待超时 → 409 草稿冲突；以上均不建立预约。
 //
 // 到期执行（runDueSchedules，由 scheduler 周期触发，启动时立即补跑一次）：
 //   按 (scheduled_at, 预约号) 顺序逐条在各自事务内处理：
@@ -31,9 +38,11 @@ const {
   insertVersionFromSnapshot,
   latestVersionNo,
   getVersionSummary,
+  readDraftRevision,
+  draftConflictError,
+  commitImmediateWithConflict,
 } = require('./publish');
 const { isRetracted } = require('./retract');
-const { draftRevisionNo } = require('./restore');
 
 const STATUSES = ['pending', 'published', 'conflict', 'cancelled'];
 
@@ -103,7 +112,8 @@ function createSchedule({ selectionList, scheduledAtRaw, baseVersionNo, editor =
     };
   }
 
-  // 走与即时发布完全相同的现有校验与求解
+  // 走与即时发布完全相同的现有校验与求解；事件 / 主张 / 关系 / 求解日期 / 修订号
+  // 取自同一个草稿快照（evaluateDraft 在单一只读事务内读出）
   const evalResult = evaluateDraft(selectionList);
   if (!evalResult.ok) {
     throw {
@@ -113,12 +123,19 @@ function createSchedule({ selectionList, scheduledAtRaw, baseVersionNo, editor =
     };
   }
   const snapshot = buildFrozenSnapshot(evalResult);
+  const expectedRevision = evalResult.revisionNo;
   const payload = { events: snapshot.eventRows, relations: snapshot.relationRows };
   const editorStr = String(editor || '');
   const noteStr = String(note || '');
 
-  const tx = db.transaction(() => {
-    // 事务内确认基准版本号仍为当前最新版本号，与即时发布同一约定
+  const id = commitImmediateWithConflict(db, () => {
+    // 事务内先确认草稿修订号未变：快照之后草稿被另一进程改过则整次拒绝，
+    // 不冻结混合内容，也不会把旧快照记成新修订号。
+    const revision = readDraftRevision();
+    if (expectedRevision !== revision) {
+      throw draftConflictError({ kind: '预约', expected: expectedRevision, current: revision });
+    }
+    // 再确认基准版本号仍为当前最新版本号，与即时发布同一约定
     const latest = latestVersionNo();
     if (base !== latest) {
       throw {
@@ -140,7 +157,8 @@ function createSchedule({ selectionList, scheduledAtRaw, baseVersionNo, editor =
       .run(
         scheduledAt,
         base,
-        draftRevisionNo(),
+        // 与冻结快照同源的修订号，保证「修订号」与「冻结内容」描述同一草稿状态
+        expectedRevision,
         JSON.stringify(selectionList),
         JSON.stringify(payload),
         snapshot.eventRows.length,
@@ -149,9 +167,8 @@ function createSchedule({ selectionList, scheduledAtRaw, baseVersionNo, editor =
         noteStr
       );
     return info.lastInsertRowid;
-  });
+  }, { kind: '预约' });
 
-  const id = tx();
   return getSchedule(id);
 }
 
